@@ -1,0 +1,57 @@
+{
+  "name": "codexhost-plugin-side-chat",
+  "version": "0.1.0",
+  "description": "Side chat panel and /btw quick side-question extension for CodexHost Web.",
+  "repository": "https://github.com/biground/codexhost-plugin-side-chat",
+  "homepage": "https://github.com/biground/codexhost-plugin-side-chat",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json",
+    "./icon": "./assets/icon.svg",
+    "./locale/*": "./locale/*"
+  },
+  "files": [
+    "lib",
+    "assets",
+    "locale",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"test/**/*.test.ts\""
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.5-alpha.1",
+    "react": "^18.2.0"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-shortcuts",
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-commands",
+        "@deepseek-ai/dsh-client-ui-input-trigger",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-session",
+        "@deepseek-ai/dsh-api-session-controller"
+      ]
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@types/react-test-renderer": "^19.3.1",
+    "esbuild": "^0.25.0",
+    "react-dom": "^18.3.1",
+    "react-test-renderer": "^18.3.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
