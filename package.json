@@ -1,6 +1,6 @@
 {
   "name": "codexhost-plugin-side-chat",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Side chat panel and /btw quick side-question extension for CodexHost Web.",
   "repository": "https://github.com/biground/codexhost-plugin-side-chat",
   "homepage": "https://github.com/biground/codexhost-plugin-side-chat",
@@ -21,6 +21,7 @@
   ],
   "scripts": {
     "build": "node build.mjs",
+    "pack:zip": "node scripts/pack-zip.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test \"test/**/*.test.ts\""
   },

@@ -1,5 +1,8 @@
 /**
- * Build `lib/index.js` (Node host Cordis entry) and `lib/client.js` (DSH Web browser module).
+ * Build:
+ * 1. `lib/index.js` (legacy v0.1.0 Node host Cordis entry)
+ * 2. `lib/client.js` (legacy v0.1.0 DSH Web browser module)
+ * 3. `backend/index.mjs` (manifestVersion 2 single-file Node ESM Host backend)
  */
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -8,9 +11,11 @@ import { build } from "esbuild";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const outDir = resolve(root, "lib");
+const backendDir = resolve(root, "backend");
 const packageId = "codexhost-plugin-side-chat";
 
 mkdirSync(outDir, { recursive: true });
+mkdirSync(backendDir, { recursive: true });
 
 const CLIENT_EXTERNALS = [
   "react",
@@ -56,4 +61,15 @@ await build({
   },
 });
 
-console.log(`Built ${packageId}: lib/index.js + lib/client.js`);
+await build({
+  entryPoints: [resolve(root, "src/v2-backend/index.ts")],
+  outfile: resolve(backendDir, "index.mjs"),
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node22",
+  sourcemap: false,
+  external: ["node:*"],
+});
+
+console.log(`Built ${packageId}: lib/index.js + lib/client.js + backend/index.mjs`);

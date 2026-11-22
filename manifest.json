@@ -1,0 +1,102 @@
+{
+  "manifestVersion": 2,
+  "id": "codexhost-side-chat",
+  "name": {
+    "en": "Side Chat (/btw)",
+    "zh-CN": "侧边聊天 (/btw)"
+  },
+  "version": "0.2.0",
+  "description": {
+    "en": "Ask parallel side questions in an isolated read-only context branch without polluting the main conversation — with persistent-first syncing, seamless ephemeral fallback, /btw quick trigger, standalone workbench, and floating drawer across Desktop and Web.",
+    "zh-CN": "基于主对话只读上下文开启并行旁路侧边聊天，不污染主对话轮次；支持持久优先与无感临时回退、常驻模式徽标、Web 端 /btw 快捷提问、独立双栏工作台及跨 Desktop/Web 悬浮抽屉同步。"
+  },
+  "details": {
+    "en": "## Overview\n\n**Side Chat (/btw)** lets you spin up isolated side-question branches directly from any active CodexHost conversation — even while the main turn is still running.\n\n### Key Capabilities\n- **Persistent-First with Seamless Ephemeral Fallback**: Automatically creates persistent attached side branches synced with Codex Desktop, and transparently falls back to runtime ephemeral branches on `-32602` unsupported parents without requiring any manual toggle.\n- **Permanent Mode Badges**: Every side-chat branch clearly displays its `Persistent` or `Ephemeral` badge and lifecycle tooltip in both the branch list and conversation header.\n- **Quick `/btw` Trigger on Web**: Type `/btw` to pop open the floating drawer, or `/btw <question>` to immediately fork and ask a side question in parallel without leaking into the main turn.\n- **Dual-Pane Standalone Workbench (`page`)**: Browse main conversations, filter side-chat branches (`All` / `Persistent` / `Ephemeral`), inspect collapsible reasoning and tool cards, answer inline approvals/questions, and tune settings in one view.\n- **Click-Through Floating Drawer (`widget`)**: Docked to bottom-right or bottom-left across Desktop and Web with strict click-through isolation outside interactive surfaces.\n- **Single-Instance Shared Backend (`backend`)**: Connects locally to the active CodexHost Client Channel and keeps side-chat metadata synchronized across Desktop and Web.",
+    "zh-CN": "## 功能简介\n\n**侧边聊天 (/btw)** 让你在不干扰主对话轮次的前提下，基于主会话只读上下文随时发起独立旁路提问——即使主会话正在执行中也可并行使用。\n\n### 核心能力\n- **持久优先 + `-32602` 无感临时回退**：创建分支时固定优先尝试持久挂载分支（随主会话保存并与 Codex Desktop 互通）；遇到不支持持久挂载的会话返回 `-32602` 时自动无感回退为运行期临时分支，全程无需手动切换开关。\n- **常驻模式徽标**：在会话列表与聊天头部始终醒目展示 **持久** / **临时** 徽标与悬停说明，分支生命周期一目了然。\n- **Web 端 `/btw` 快捷提问**：在 Web 主输入框输入 `/btw` 立即展开侧边抽屉，或输入 `/btw <问题>` 直接发起旁路提问；即使主会话处于运行态也完整拦截，绝不漏入主会话。\n- **独立双栏工作台（`page`）**：左栏按主会话与模式（全部 / 持久 / 临时）管理全部分支，右栏提供全屏问答、可折叠思考与工具调用卡片、一键停止、内联审批/提问交互与快捷设置。\n- **跨端悬浮抽屉挂件（`widget`）**：在 Desktop 与 Web 主窗口提供非交互区点击透传的角落胶囊与侧滑抽屉，支持停靠位置与显隐配置。\n- **共享 Host 单实例后端（`backend`）**：通过本机 `client-hosts` 客户端通道与 CodexHost 通信，跨 Desktop 与 Web 实时共享侧边会话记录。"
+  },
+  "author": "biground",
+  "repository": "https://github.com/biground/codexhost-plugin-side-chat",
+  "categories": ["workflow", "interface", "tools"],
+  "icon": "assets/icon.png",
+  "screenshots": ["assets/preview.png"],
+  "settingsSchema": [
+    {
+      "key": "widgetPosition",
+      "type": "select",
+      "label": {
+        "en": "Widget Dock Position",
+        "zh-CN": "悬浮挂件停靠位置"
+      },
+      "description": {
+        "en": "Choose which bottom corner hosts the floating Side Chat launcher and slide-over drawer.",
+        "zh-CN": "选择侧边聊天悬浮唤醒胶囊与抽屉面板在主窗口中的停靠角落。"
+      },
+      "options": [
+        {
+          "value": "bottom-right",
+          "label": {
+            "en": "Bottom Right",
+            "zh-CN": "右下角"
+          }
+        },
+        {
+          "value": "bottom-left",
+          "label": {
+            "en": "Bottom Left",
+            "zh-CN": "左下角"
+          }
+        }
+      ],
+      "default": "bottom-right"
+    },
+    {
+      "key": "showFloatingLauncher",
+      "type": "boolean",
+      "label": {
+        "en": "Show Floating Launcher",
+        "zh-CN": "常驻显示悬浮唤醒按钮"
+      },
+      "description": {
+        "en": "Display the floating Side Chat pill button in the main window corner. When hidden, you can still open the drawer via the Web topbar button or /btw.",
+        "zh-CN": "在主窗口角落常驻显示侧边聊天悬浮胶囊按钮；关闭后仍可通过 Web 顶栏按钮或 /btw 随时展开抽屉。"
+      },
+      "default": true
+    },
+    {
+      "key": "enableWebBtwShortcut",
+      "type": "boolean",
+      "label": {
+        "en": "Enable Web /btw Shortcut",
+        "zh-CN": "启用 Web 端 /btw 快捷提问"
+      },
+      "description": {
+        "en": "Intercept /btw and /btw <question> in the Web main composer to open Side Chat or start a parallel side branch immediately.",
+        "zh-CN": "在 Web 主会话输入框拦截 /btw 与 /btw <问题>，一键唤起侧边抽屉或直接发起旁路提问。"
+      },
+      "default": true
+    }
+  ],
+  "page": {
+    "apiVersion": 1,
+    "entry": "page/index.mjs",
+    "style": "page/style.css",
+    "title": {
+      "en": "Side Chat",
+      "zh-CN": "侧边聊天"
+    }
+  },
+  "widget": {
+    "apiVersion": 1,
+    "entry": "widget/index.mjs",
+    "style": "widget/style.css"
+  },
+  "web": {
+    "apiVersion": 1,
+    "entry": "web/index.mjs",
+    "style": "web/style.css"
+  },
+  "backend": {
+    "apiVersion": 1,
+    "entry": "backend/index.mjs"
+  }
+}
