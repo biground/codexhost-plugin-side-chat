@@ -191,6 +191,7 @@ function createClientUserMessageId() {
 import { readdir, readFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { createConnection } from "node:net";
+import { homedir } from "node:os";
 import path from "node:path";
 
 // src/v2-backend/json.ts
@@ -253,12 +254,39 @@ var ClientChannelError = class extends Error {
     this.retryableTransport = options?.retryableTransport === true;
   }
 };
-var REQUEST_TIMEOUT_MS = 8500;
+var DEFAULT_REQUEST_TIMEOUT_MS = 4500;
 var PROBE_TIMEOUT_MS = 600;
 function resolveClientChannelDir(dataDir) {
   const override = process.env.CODEXHOST_SIDE_CHAT_CHANNEL_DIR?.trim();
   if (override) return path.resolve(override);
   return path.resolve(dataDir, "..", "..", "client-hosts");
+}
+function resolveClientChannelCandidateDirs(dataDir, explicitOverride) {
+  if (explicitOverride?.trim()) {
+    return [path.resolve(explicitOverride.trim())];
+  }
+  const envOverride = process.env.CODEXHOST_SIDE_CHAT_CHANNEL_DIR?.trim();
+  if (envOverride) {
+    return [path.resolve(envOverride)];
+  }
+  const dirs = [];
+  const pushUnique = (candidate) => {
+    if (!candidate?.trim()) return;
+    const resolved = path.resolve(candidate.trim());
+    if (!dirs.includes(resolved)) dirs.push(resolved);
+  };
+  const hostDataRoot = path.resolve(dataDir, "..", "..");
+  pushUnique(path.join(hostDataRoot, "client-hosts"));
+  if (path.basename(hostDataRoot).toLowerCase() === ".codexhost") {
+    try {
+      const home = process.env.HOME?.trim() || process.env.USERPROFILE?.trim() || homedir();
+      if (home) {
+        pushUnique(path.join(home, ".codexhost", "client-hosts"));
+      }
+    } catch {
+    }
+  }
+  return dirs;
 }
 function isProcessAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -308,11 +336,75 @@ function probeTcpLoopback(port, timeoutMs = PROBE_TIMEOUT_MS) {
     socket.once("error", () => finish(false));
   });
 }
+function probeAuthenticatedDescriptor(descriptor, timeoutMs = PROBE_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      resolve(ok);
+    };
+    const probeBody = "{}";
+    const req = httpRequest(
+      {
+        hostname: "127.0.0.1",
+        port: descriptor.port,
+        path: "/v1/__probe__",
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(Buffer.byteLength(probeBody, "utf8")),
+          authorization: `Bearer ${descriptor.token}`
+        },
+        timeout: timeoutMs
+      },
+      (res) => {
+        const status = res.statusCode ?? 0;
+        const chunks = [];
+        res.on("data", (chunk) => {
+          chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+        });
+        res.on("end", () => {
+          if (status === 401 || status === 403 || status === 0) {
+            finish(false);
+            return;
+          }
+          const raw = Buffer.concat(chunks).toString("utf8").trim();
+          if (status >= 200 && status < 300) {
+            finish(true);
+            return;
+          }
+          if (status === 404 && raw.length > 0) {
+            try {
+              const parsed = JSON.parse(raw);
+              finish(isPlainRecord(parsed));
+              return;
+            } catch {
+              finish(false);
+              return;
+            }
+          }
+          finish(false);
+        });
+        res.on("error", () => finish(false));
+      }
+    );
+    req.on("timeout", () => {
+      req.destroy();
+      finish(false);
+    });
+    req.on("error", () => finish(false));
+    req.end(probeBody);
+  });
+}
+function descriptorAttemptKey(descriptor) {
+  return `${descriptor.filePath}:${descriptor.token}`;
+}
 var LocalClientChannelClient = class {
   dataDir;
   explicitChannelDir;
   cached = null;
-  cachedDir = null;
+  cachedPrimaryDir = null;
   disposed = false;
   constructor(dataDir, channelDirOverride) {
     this.dataDir = dataDir;
@@ -324,69 +416,86 @@ var LocalClientChannelClient = class {
   dispose() {
     this.disposed = true;
     this.cached = null;
-    this.cachedDir = null;
+    this.cachedPrimaryDir = null;
   }
   invalidateCache() {
     this.cached = null;
-    this.cachedDir = null;
+    this.cachedPrimaryDir = null;
   }
   async discoverDescriptors() {
-    const dir = this.channelDir;
-    let entries;
-    try {
-      entries = await readdir(dir);
-    } catch {
-      return [];
-    }
+    const candidateDirs = resolveClientChannelCandidateDirs(this.dataDir, this.explicitChannelDir);
+    const seenKeys = /* @__PURE__ */ new Set();
     const candidates = [];
-    for (const name of entries) {
-      if (!/^host-.*\.json$/iu.test(name)) continue;
-      const fullPath = path.join(dir, name);
+    for (const dir of candidateDirs) {
+      let entries;
       try {
-        const text = await readFile(fullPath, "utf8");
-        const parsed = parseDescriptor(JSON.parse(text), fullPath);
-        if (parsed && isProcessAlive(parsed.pid)) {
-          candidates.push(parsed);
-        }
+        entries = await readdir(dir);
       } catch {
+        continue;
       }
+      for (const name of entries) {
+        if (!/^host-.*\.json$/iu.test(name)) continue;
+        const fullPath = path.join(dir, name);
+        try {
+          const text = await readFile(fullPath, "utf8");
+          const parsed = parseDescriptor(JSON.parse(text), fullPath);
+          if (parsed && isProcessAlive(parsed.pid)) {
+            const key = `${parsed.pid}:${parsed.port}:${parsed.epoch}`;
+            if (!seenKeys.has(key)) {
+              seenKeys.add(key);
+              candidates.push(parsed);
+            }
+          }
+        } catch {
+        }
+      }
+      if (candidates.length > 0) break;
     }
     candidates.sort((a, b) => {
-      const timeDiff = b.startedAt - a.startedAt;
-      if (timeDiff !== 0) return timeDiff;
       const ownerA = a.owner === "service" ? 1 : 0;
       const ownerB = b.owner === "service" ? 1 : 0;
       if (ownerB !== ownerA) return ownerB - ownerA;
+      const timeDiff = b.startedAt - a.startedAt;
+      if (timeDiff !== 0) return timeDiff;
       return b.pid - a.pid;
     });
     return candidates;
   }
-  async getActiveDescriptor(forceRescan = false) {
-    const dir = this.channelDir;
-    if (this.cachedDir !== dir) {
+  async getActiveDescriptor(forceRescan = false, excludeAttemptKeys) {
+    const primaryDir = this.channelDir;
+    if (this.cachedPrimaryDir !== primaryDir) {
       this.cached = null;
-      this.cachedDir = dir;
+      this.cachedPrimaryDir = primaryDir;
     }
-    if (!forceRescan && this.cached && isProcessAlive(this.cached.pid)) {
+    if (!forceRescan && this.cached && !excludeAttemptKeys?.has(descriptorAttemptKey(this.cached)) && isProcessAlive(this.cached.pid)) {
       return this.cached;
     }
     this.cached = null;
-    const descriptors = await this.discoverDescriptors();
+    const descriptors = (await this.discoverDescriptors()).filter(
+      (item) => !excludeAttemptKeys?.has(descriptorAttemptKey(item))
+    );
+    for (const candidate of descriptors) {
+      if (await probeAuthenticatedDescriptor(candidate)) {
+        this.cached = candidate;
+        this.cachedPrimaryDir = primaryDir;
+        return candidate;
+      }
+    }
     for (const candidate of descriptors) {
       if (await probeTcpLoopback(candidate.port)) {
         this.cached = candidate;
-        this.cachedDir = dir;
+        this.cachedPrimaryDir = primaryDir;
         return candidate;
       }
     }
     if (descriptors.length > 0) {
       this.cached = descriptors[0];
-      this.cachedDir = dir;
+      this.cachedPrimaryDir = primaryDir;
       return this.cached;
     }
     throw new ClientChannelError(
       "side-chat/channel-offline",
-      `No active CodexHost client channel found in ${dir}.`,
+      `No active CodexHost client channel found in ${primaryDir}.`,
       { retryableTransport: true }
     );
   }
@@ -405,12 +514,13 @@ var LocalClientChannelClient = class {
         };
       }
       for (const candidate of descriptors) {
-        const reachable = await probeTcpLoopback(candidate.port);
+        const reachable = await probeAuthenticatedDescriptor(candidate);
         if (reachable) {
           this.cached = candidate;
+          this.cachedPrimaryDir = this.channelDir;
           return {
             connected: true,
-            channelDir: this.channelDir,
+            channelDir: path.dirname(candidate.filePath),
             pid: candidate.pid,
             port: candidate.port,
             epoch: candidate.epoch,
@@ -425,7 +535,7 @@ var LocalClientChannelClient = class {
         pid: descriptors[0]?.pid ?? null,
         port: descriptors[0]?.port ?? null,
         epoch: descriptors[0]?.epoch ?? null,
-        error: "Discovered CodexHost client channel port is not accepting connections."
+        error: "Discovered CodexHost client channel port is not accepting authenticated connections."
       };
     } catch (error) {
       this.cached = null;
@@ -439,7 +549,7 @@ var LocalClientChannelClient = class {
       };
     }
   }
-  async postJsonOnce(descriptor, endpointPath, payload, methodLabel) {
+  async postJsonOnce(descriptor, endpointPath, payload, methodLabel, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
     if (this.disposed) {
       throw new ClientChannelError("side-chat/disposed", "Backend is shutting down.");
     }
@@ -458,7 +568,7 @@ var LocalClientChannelClient = class {
             authorization: `Bearer ${descriptor.token}`
             // Explicitly omit any Origin header (client-channel-server rejects requests with Origin).
           },
-          timeout: REQUEST_TIMEOUT_MS
+          timeout: timeoutMs
         },
         (res) => {
           const chunks = [];
@@ -505,9 +615,9 @@ var LocalClientChannelClient = class {
         { status: response.status, method: methodLabel, cause }
       );
     }
-    if (response.status === 401) {
+    if (response.status === 401 || response.status === 403) {
       throw new ClientChannelError(-32001, "Unauthorized client channel token", {
-        status: 401,
+        status: response.status,
         method: methodLabel,
         retryableTransport: true
       });
@@ -529,15 +639,30 @@ var LocalClientChannelClient = class {
     }
     return parsed;
   }
-  async postJsonWithRescan(endpointPath, payload, methodLabel, allowRescanRetry = true) {
+  async postJsonWithRescan(endpointPath, payload, methodLabel, allowRescanRetry = true, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
+    const failedKeys = /* @__PURE__ */ new Set();
     const first = await this.getActiveDescriptor(false);
     try {
-      return await this.postJsonOnce(first, endpointPath, payload, methodLabel);
+      return await this.postJsonOnce(first, endpointPath, payload, methodLabel, timeoutMs);
     } catch (error) {
       if (allowRescanRetry && error instanceof ClientChannelError && error.retryableTransport) {
+        failedKeys.add(descriptorAttemptKey(first));
         this.cached = null;
-        const refreshed = await this.getActiveDescriptor(true);
-        return this.postJsonOnce(refreshed, endpointPath, payload, methodLabel);
+        try {
+          const refreshed = await this.getActiveDescriptor(true, failedKeys);
+          return await this.postJsonOnce(
+            refreshed,
+            endpointPath,
+            payload,
+            methodLabel,
+            timeoutMs
+          );
+        } catch (secondError) {
+          if (secondError instanceof ClientChannelError && secondError.code === "side-chat/channel-offline" && failedKeys.size > 0) {
+            throw error;
+          }
+          throw secondError;
+        }
       }
       throw error;
     }
@@ -547,7 +672,8 @@ var LocalClientChannelClient = class {
       "/v1/rpc",
       { method, params },
       method,
-      options?.allowRescanRetry ?? true
+      options?.allowRescanRetry ?? true,
+      options?.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
     );
     if (isPlainRecord(envelope) && "result" in envelope) {
       return envelope.result;
@@ -562,18 +688,25 @@ var LocalClientChannelClient = class {
     if (options?.knownTurns !== void 0) {
       body.knownTurns = options.knownTurns;
     }
-    const envelope = await this.postJsonWithRescan("/v1/snapshot", body, "snapshot", true);
+    const envelope = await this.postJsonWithRescan(
+      "/v1/snapshot",
+      body,
+      "snapshot",
+      true,
+      options?.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
+    );
     if (isPlainRecord(envelope) && "result" in envelope) {
       return envelope.result;
     }
     return envelope;
   }
-  async respond(payload) {
+  async respond(payload, options) {
     const envelope = await this.postJsonWithRescan(
       "/v1/respond",
       payload,
       "respond",
-      true
+      true,
+      options?.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
     );
     if (isPlainRecord(envelope) && "result" in envelope) {
       return envelope.result;
@@ -1043,8 +1176,8 @@ function extractErrorDetails(error) {
 }
 function mapRawMainThread(raw) {
   if (!isPlainRecord(raw)) return void 0;
-  const id = typeof raw.id === "string" ? raw.id.trim() : "";
-  if (!id) return void 0;
+  const rawId = typeof raw.id === "string" && raw.id.trim().length > 0 ? raw.id.trim() : typeof raw.threadId === "string" && raw.threadId.trim().length > 0 ? raw.threadId.trim() : "";
+  if (!rawId) return void 0;
   if (typeof raw.attachedToThreadId === "string" && raw.attachedToThreadId.trim().length > 0) {
     return void 0;
   }
@@ -1052,12 +1185,12 @@ function mapRawMainThread(raw) {
   const createdAt = toIsoTimestamp(raw.createdAt, now);
   const updatedAt = toIsoTimestamp(raw.updatedAt, createdAt);
   const preview = stripSideChatBoundary(typeof raw.preview === "string" ? raw.preview : "");
-  const cleanName = typeof raw.name === "string" ? stripSideChatBoundary(raw.name).trim() : "";
-  const title = cleanName || deriveSideChatTitle(preview) || id;
+  const cleanName = typeof raw.name === "string" ? stripSideChatBoundary(raw.name).trim() : typeof raw.title === "string" ? stripSideChatBoundary(raw.title).trim() : "";
+  const title = cleanName || deriveSideChatTitle(preview) || rawId;
   const statusObj = isPlainRecord(raw.status) ? raw.status : void 0;
   const statusType = typeof statusObj?.type === "string" ? statusObj.type : "idle";
   return {
-    threadId: id,
+    threadId: rawId,
     title,
     preview,
     cwd: typeof raw.cwd === "string" ? raw.cwd : "",
@@ -1139,17 +1272,29 @@ function asDistinctForkId(result, sourceThreadId) {
   }
   return id.trim();
 }
+var MAIN_THREADS_CACHE_TTL_MS = 1500;
+var CATALOG_PRIMARY_TIMEOUT_MS = 4200;
+var CATALOG_FALLBACK_TIMEOUT_MS = 2e3;
+var ATTACHED_LIST_TIMEOUT_MS = 1800;
+var GLOBAL_ATTACHED_DEADLINE_MS = 2500;
 var SideChatV2BackendService = class {
   store;
   channel;
   extensionId;
+  inFlightMainThreads = null;
+  cachedMainThreads = null;
   constructor(options) {
     this.extensionId = options.extensionId;
     this.store = new V2SideChatStore(options.dataDir);
     this.channel = new LocalClientChannelClient(options.dataDir, options.channelDir);
   }
   dispose() {
+    this.inFlightMainThreads = null;
+    this.cachedMainThreads = null;
     this.channel.dispose();
+  }
+  invalidateMainThreadsCache() {
+    this.cachedMainThreads = null;
   }
   ping() {
     return okReply({
@@ -1169,32 +1314,89 @@ var SideChatV2BackendService = class {
       error: probe.error
     });
   }
-  async fetchMainThreadsRaw() {
+  extractCatalogRows(payload) {
+    if (!isPlainRecord(payload)) {
+      return { rows: [], nextLiveCursor: null };
+    }
+    const rows = Array.isArray(payload.threads) ? payload.threads : Array.isArray(payload.data) ? payload.data : [];
+    const cursorObj = isPlainRecord(payload.officialCursor) ? payload.officialCursor : void 0;
+    const nextLiveCursor = typeof cursorObj?.live === "string" && cursorObj.live.trim().length > 0 ? cursorObj.live : null;
+    return { rows, nextLiveCursor };
+  }
+  async fetchMainThreadsUncached() {
     const knownSideChatIds = new Set(this.store.list().map((record) => record.threadId));
-    let rawRows = [];
+    const rawRows = [];
+    const startedAt = Date.now();
     try {
-      const catalog = await this.channel.rpc("codexhost/thread/catalog/read", {
-        includeArchived: false
-      });
-      if (isPlainRecord(catalog) && Array.isArray(catalog.threads)) {
-        rawRows = catalog.threads;
-      } else if (isPlainRecord(catalog) && Array.isArray(catalog.data)) {
-        rawRows = catalog.data;
+      const firstCatalog = await this.channel.rpc(
+        "codexhost/thread/catalog/read",
+        { includeArchived: false },
+        { timeoutMs: CATALOG_PRIMARY_TIMEOUT_MS }
+      );
+      const firstPage = this.extractCatalogRows(firstCatalog);
+      rawRows.push(...firstPage.rows);
+      let nextLive = firstPage.nextLiveCursor;
+      let extraPages = 0;
+      while (nextLive && extraPages < 2 && Date.now() - startedAt < 1500) {
+        extraPages++;
+        const remainingMs = Math.max(800, CATALOG_PRIMARY_TIMEOUT_MS - (Date.now() - startedAt));
+        try {
+          const nextCatalog = await this.channel.rpc(
+            "codexhost/thread/catalog/read",
+            {
+              includeArchived: false,
+              officialCursor: { live: nextLive }
+            },
+            { timeoutMs: remainingMs }
+          );
+          const page = this.extractCatalogRows(nextCatalog);
+          rawRows.push(...page.rows);
+          nextLive = page.nextLiveCursor;
+        } catch {
+          break;
+        }
       }
-    } catch (error) {
-      if (error instanceof ClientChannelError && error.code === "side-chat/channel-offline") {
-        throw error;
+    } catch (primaryError) {
+      if (primaryError instanceof ClientChannelError && primaryError.code === "side-chat/channel-offline") {
+        throw primaryError;
       }
-      const listed = await this.channel.rpc("thread/list", {
-        archived: false,
-        sortKey: "updated_at",
-        sortDirection: "desc",
-        limit: 100
-      });
-      if (isPlainRecord(listed) && Array.isArray(listed.data)) {
-        rawRows = listed.data;
-      } else if (isPlainRecord(listed) && Array.isArray(listed.threads)) {
-        rawRows = listed.threads;
+      const isMethodMissing = primaryError instanceof ClientChannelError && primaryError.code === -32601;
+      let recovered = false;
+      if (!isMethodMissing) {
+        try {
+          const externalOnlyCatalog = await this.channel.rpc(
+            "codexhost/thread/catalog/read",
+            {
+              includeArchived: false,
+              officialCursor: { live: null }
+            },
+            { timeoutMs: CATALOG_FALLBACK_TIMEOUT_MS }
+          );
+          const extPage = this.extractCatalogRows(externalOnlyCatalog);
+          rawRows.push(...extPage.rows);
+          recovered = true;
+        } catch (extError) {
+          if (extError instanceof ClientChannelError && extError.code === "side-chat/channel-offline") {
+            throw extError;
+          }
+        }
+      }
+      if (!recovered) {
+        const listed = await this.channel.rpc(
+          "thread/list",
+          {
+            archived: false,
+            sortKey: "updated_at",
+            sortDirection: "desc",
+            limit: 100
+          },
+          { timeoutMs: CATALOG_FALLBACK_TIMEOUT_MS }
+        );
+        if (isPlainRecord(listed) && Array.isArray(listed.data)) {
+          rawRows.push(...listed.data);
+        } else if (isPlainRecord(listed) && Array.isArray(listed.threads)) {
+          rawRows.push(...listed.threads);
+        }
       }
     }
     const deduped = /* @__PURE__ */ new Map();
@@ -1208,6 +1410,24 @@ var SideChatV2BackendService = class {
     }
     return [...deduped.values()].sort(compareSummaryDesc);
   }
+  async fetchMainThreadsRaw() {
+    if (this.cachedMainThreads && Date.now() - this.cachedMainThreads.fetchedAt < MAIN_THREADS_CACHE_TTL_MS) {
+      return this.cachedMainThreads.threads;
+    }
+    if (this.inFlightMainThreads) {
+      return this.inFlightMainThreads;
+    }
+    const pending = this.fetchMainThreadsUncached().then((threads) => {
+      this.cachedMainThreads = { threads, fetchedAt: Date.now() };
+      return threads;
+    }).finally(() => {
+      if (this.inFlightMainThreads === pending) {
+        this.inFlightMainThreads = null;
+      }
+    });
+    this.inFlightMainThreads = pending;
+    return pending;
+  }
   async listMainThreads() {
     try {
       const threads = await this.fetchMainThreadsRaw();
@@ -1217,14 +1437,18 @@ var SideChatV2BackendService = class {
       return errorReply(code, message, { threads: [], channelConnected: false });
     }
   }
-  async listAttachedForSource(sourceThreadId) {
+  async listAttachedForSource(sourceThreadId, timeoutMs = ATTACHED_LIST_TIMEOUT_MS) {
     try {
-      const res = await this.channel.rpc("thread/list", {
-        attachedToThreadId: sourceThreadId,
-        sortKey: "updated_at",
-        sortDirection: "desc",
-        limit: 100
-      });
+      const res = await this.channel.rpc(
+        "thread/list",
+        {
+          attachedToThreadId: sourceThreadId,
+          sortKey: "updated_at",
+          sortDirection: "desc",
+          limit: 100
+        },
+        { timeoutMs }
+      );
       const rows = isPlainRecord(res) && Array.isArray(res.data) ? res.data : [];
       return { rows, connected: true };
     } catch {
@@ -1250,7 +1474,7 @@ var SideChatV2BackendService = class {
     try {
       const mainThreads = await this.fetchMainThreadsRaw();
       channelConnected = true;
-      for (const main of mainThreads.slice(0, 12)) {
+      for (const main of mainThreads.slice(0, 8)) {
         sourceIds.add(main.threadId);
       }
     } catch {
@@ -1262,17 +1486,33 @@ var SideChatV2BackendService = class {
       bucket.push(record);
       bySourceLocal.set(record.sourceThreadId, bucket);
     }
-    const sourceList = [...sourceIds];
-    const attachedEntries = await Promise.all(
-      sourceList.map(async (sid) => {
-        const res = await this.listAttachedForSource(sid);
-        if (res.connected) channelConnected = true;
-        return [sid, res.rows];
-      })
-    );
+    const sourceList = [...sourceIds].slice(0, 12);
+    const attachedBySource = /* @__PURE__ */ new Map();
+    if (sourceList.length > 0) {
+      const queries = Promise.all(
+        sourceList.map(async (sid) => {
+          const res = await this.listAttachedForSource(sid, ATTACHED_LIST_TIMEOUT_MS);
+          if (res.connected) channelConnected = true;
+          attachedBySource.set(sid, res.rows);
+        })
+      );
+      let deadlineTimer;
+      await Promise.race([
+        queries,
+        new Promise((resolveDeadline) => {
+          deadlineTimer = setTimeout(resolveDeadline, GLOBAL_ATTACHED_DEADLINE_MS);
+          deadlineTimer.unref?.();
+        })
+      ]);
+      if (deadlineTimer !== void 0) clearTimeout(deadlineTimer);
+    }
     const combinedMap = /* @__PURE__ */ new Map();
-    for (const [sid, rows] of attachedEntries) {
-      const merged = mergeThreadsForSource(sid, bySourceLocal.get(sid) ?? [], rows);
+    for (const sid of sourceIds) {
+      const merged = mergeThreadsForSource(
+        sid,
+        bySourceLocal.get(sid) ?? [],
+        attachedBySource.get(sid) ?? []
+      );
       for (const item of merged) {
         combinedMap.set(item.threadId, item);
       }
@@ -1329,6 +1569,7 @@ var SideChatV2BackendService = class {
       title: initialTitle,
       boundaryConsumed: false
     });
+    this.invalidateMainThreadsCache();
     if (question.length > 0) {
       const wireText = injectSideChatBoundary(question);
       const clientUserMessageId = createClientUserMessageId();
@@ -1629,6 +1870,7 @@ var SideChatV2BackendService = class {
       }
     }
     const removed = this.store.remove(threadId, sourceThreadId);
+    this.invalidateMainThreadsCache();
     return okReply({
       threadId,
       mode,

@@ -11,7 +11,7 @@
 
 ### Overview
 
-`codexhost-plugin-side-chat` (`v0.2.0`) is a unified **CodexHost `manifestVersion: 2` Host Extension** that brings isolated parallel side-question branching to **both CodexHost Desktop and CodexHost Web**:
+`codexhost-plugin-side-chat` (`v0.2.1`) is a unified **CodexHost `manifestVersion: 2` Host Extension** that brings isolated parallel side-question branching to **both CodexHost Desktop and CodexHost Web**:
 
 - **Standalone Dual-Pane Workbench (`page`)**: Browse main conversations, filter side-chat branches (`All` / `Persistent` / `Ephemeral`), inspect collapsible reasoning & tool cards, answer inline approvals/questions, and configure settings.
 - **Cross-Platform Floating Drawer (`widget`)**: Automatically mounted in a Shadow DOM container on both Desktop and Web main windows, with strict `pointer-events: none` click-through outside interactive surfaces.
@@ -68,7 +68,7 @@ npm test
 
 ### 项目简介
 
-`codexhost-plugin-side-chat`（`v0.2.0`）是基于 **CodexHost `manifestVersion: 2`** 的跨端统一 Host 扩展，在 **CodexHost Desktop 与 Web** 双端提供隔离的并行旁路提问能力：
+`codexhost-plugin-side-chat`（`v0.2.1`）是基于 **CodexHost `manifestVersion: 2`** 的跨端统一 Host 扩展，在 **CodexHost Desktop 与 Web** 双端提供隔离的并行旁路提问能力：
 
 - **独立双栏工作台（`page`）**：左栏按主会话与模式（全部 / 持久 / 临时）管理全部分支，右栏提供全屏问答、可折叠思考与工具卡片、一键停止、内联审批/提问与扩展设置。
 - **跨端悬浮抽屉挂件（`widget`）**：在 Desktop 与 Web 主窗口通过 Shadow DOM 自动挂载，外层严格保持 `pointer-events: none` 点击透传，仅悬浮胶囊与抽屉面板响应交互。

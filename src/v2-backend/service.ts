@@ -99,8 +99,13 @@ function extractErrorDetails(error: unknown): { code: number | string; message: 
 
 function mapRawMainThread(raw: unknown): MainThreadSummary | undefined {
   if (!isPlainRecord(raw)) return undefined;
-  const id = typeof raw.id === "string" ? raw.id.trim() : "";
-  if (!id) return undefined;
+  const rawId =
+    typeof raw.id === "string" && raw.id.trim().length > 0
+      ? raw.id.trim()
+      : typeof raw.threadId === "string" && raw.threadId.trim().length > 0
+        ? raw.threadId.trim()
+        : "";
+  if (!rawId) return undefined;
 
   // Exclude attached side-chat child threads from main thread listings.
   if (typeof raw.attachedToThreadId === "string" && raw.attachedToThreadId.trim().length > 0) {
@@ -111,13 +116,18 @@ function mapRawMainThread(raw: unknown): MainThreadSummary | undefined {
   const createdAt = toIsoTimestamp(raw.createdAt, now);
   const updatedAt = toIsoTimestamp(raw.updatedAt, createdAt);
   const preview = stripSideChatBoundary(typeof raw.preview === "string" ? raw.preview : "");
-  const cleanName = typeof raw.name === "string" ? stripSideChatBoundary(raw.name).trim() : "";
-  const title = cleanName || deriveSideChatTitle(preview) || id;
+  const cleanName =
+    typeof raw.name === "string"
+      ? stripSideChatBoundary(raw.name).trim()
+      : typeof raw.title === "string"
+        ? stripSideChatBoundary(raw.title).trim()
+        : "";
+  const title = cleanName || deriveSideChatTitle(preview) || rawId;
   const statusObj = isPlainRecord(raw.status) ? raw.status : undefined;
   const statusType = typeof statusObj?.type === "string" ? statusObj.type : "idle";
 
   return {
-    threadId: id,
+    threadId: rawId,
     title,
     preview,
     cwd: typeof raw.cwd === "string" ? raw.cwd : "",
@@ -212,10 +222,18 @@ function asDistinctForkId(result: ThreadForkResponse, sourceThreadId: string): s
   return id.trim();
 }
 
+const MAIN_THREADS_CACHE_TTL_MS = 1_500;
+const CATALOG_PRIMARY_TIMEOUT_MS = 4_200;
+const CATALOG_FALLBACK_TIMEOUT_MS = 2_000;
+const ATTACHED_LIST_TIMEOUT_MS = 1_800;
+const GLOBAL_ATTACHED_DEADLINE_MS = 2_500;
+
 export class SideChatV2BackendService {
   readonly store: V2SideChatStore;
   readonly channel: LocalClientChannelClient;
   readonly extensionId: string;
+  private inFlightMainThreads: Promise<MainThreadSummary[]> | null = null;
+  private cachedMainThreads: { threads: MainThreadSummary[]; fetchedAt: number } | null = null;
 
   constructor(options: {
     readonly extensionId: string;
@@ -228,7 +246,13 @@ export class SideChatV2BackendService {
   }
 
   dispose(): void {
+    this.inFlightMainThreads = null;
+    this.cachedMainThreads = null;
     this.channel.dispose();
+  }
+
+  private invalidateMainThreadsCache(): void {
+    this.cachedMainThreads = null;
   }
 
   ping(): StrictJsonObject {
@@ -251,37 +275,117 @@ export class SideChatV2BackendService {
     });
   }
 
-  private async fetchMainThreadsRaw(): Promise<MainThreadSummary[]> {
+  private extractCatalogRows(payload: unknown): {
+    rows: unknown[];
+    nextLiveCursor: string | null;
+  } {
+    if (!isPlainRecord(payload)) {
+      return { rows: [], nextLiveCursor: null };
+    }
+    const rows = Array.isArray(payload.threads)
+      ? payload.threads
+      : Array.isArray(payload.data)
+        ? payload.data
+        : [];
+    const cursorObj = isPlainRecord(payload.officialCursor) ? payload.officialCursor : undefined;
+    const nextLiveCursor =
+      typeof cursorObj?.live === "string" && cursorObj.live.trim().length > 0
+        ? cursorObj.live
+        : null;
+    return { rows, nextLiveCursor };
+  }
+
+  private async fetchMainThreadsUncached(): Promise<MainThreadSummary[]> {
     const knownSideChatIds = new Set(this.store.list().map((record) => record.threadId));
-    let rawRows: unknown[] = [];
+    const rawRows: unknown[] = [];
+    const startedAt = Date.now();
 
     try {
-      const catalog = await this.channel.rpc<unknown>("codexhost/thread/catalog/read", {
-        includeArchived: false,
-      });
-      if (isPlainRecord(catalog) && Array.isArray(catalog.threads)) {
-        rawRows = catalog.threads;
-      } else if (isPlainRecord(catalog) && Array.isArray(catalog.data)) {
-        rawRows = catalog.data;
+      const firstCatalog = await this.channel.rpc<unknown>(
+        "codexhost/thread/catalog/read",
+        { includeArchived: false },
+        { timeoutMs: CATALOG_PRIMARY_TIMEOUT_MS },
+      );
+      const firstPage = this.extractCatalogRows(firstCatalog);
+      rawRows.push(...firstPage.rows);
+
+      // Fetch up to 2 additional official pages only when fast, keeping well inside 10s IPC budget.
+      let nextLive = firstPage.nextLiveCursor;
+      let extraPages = 0;
+      while (nextLive && extraPages < 2 && Date.now() - startedAt < 1_500) {
+        extraPages++;
+        const remainingMs = Math.max(800, CATALOG_PRIMARY_TIMEOUT_MS - (Date.now() - startedAt));
+        try {
+          const nextCatalog = await this.channel.rpc<unknown>(
+            "codexhost/thread/catalog/read",
+            {
+              includeArchived: false,
+              officialCursor: { live: nextLive },
+            },
+            { timeoutMs: remainingMs },
+          );
+          const page = this.extractCatalogRows(nextCatalog);
+          rawRows.push(...page.rows);
+          nextLive = page.nextLiveCursor;
+        } catch {
+          break;
+        }
       }
-    } catch (error) {
-      // Fall back to `thread/list` if catalog RPC is unavailable or unsupported.
+    } catch (primaryError) {
       if (
-        error instanceof ClientChannelError &&
-        error.code === "side-chat/channel-offline"
+        primaryError instanceof ClientChannelError &&
+        primaryError.code === "side-chat/channel-offline"
       ) {
-        throw error;
+        throw primaryError;
       }
-      const listed = await this.channel.rpc<unknown>("thread/list", {
-        archived: false,
-        sortKey: "updated_at",
-        sortDirection: "desc",
-        limit: 100,
-      });
-      if (isPlainRecord(listed) && Array.isArray(listed.data)) {
-        rawRows = listed.data;
-      } else if (isPlainRecord(listed) && Array.isArray(listed.threads)) {
-        rawRows = listed.threads;
+
+      const isMethodMissing =
+        primaryError instanceof ClientChannelError && primaryError.code === -32601;
+
+      let recovered = false;
+      if (!isMethodMissing) {
+        // In codexhost 0.25+, stock Codex starts lazily (`deferStart: true`) or may be unavailable/
+        // unauthenticated while External Harnesses (Antigravity, Claude Code, DeepSeek, etc.) work.
+        // Passing `officialCursor: { live: null }` short-circuits `prepareOfficial()` in
+        // `packages/host-runtime/src/thread-catalog.ts` and returns all local External Threads immediately!
+        try {
+          const externalOnlyCatalog = await this.channel.rpc<unknown>(
+            "codexhost/thread/catalog/read",
+            {
+              includeArchived: false,
+              officialCursor: { live: null },
+            },
+            { timeoutMs: CATALOG_FALLBACK_TIMEOUT_MS },
+          );
+          const extPage = this.extractCatalogRows(externalOnlyCatalog);
+          rawRows.push(...extPage.rows);
+          recovered = true;
+        } catch (extError) {
+          if (
+            extError instanceof ClientChannelError &&
+            extError.code === "side-chat/channel-offline"
+          ) {
+            throw extError;
+          }
+        }
+      }
+
+      if (!recovered) {
+        const listed = await this.channel.rpc<unknown>(
+          "thread/list",
+          {
+            archived: false,
+            sortKey: "updated_at",
+            sortDirection: "desc",
+            limit: 100,
+          },
+          { timeoutMs: CATALOG_FALLBACK_TIMEOUT_MS },
+        );
+        if (isPlainRecord(listed) && Array.isArray(listed.data)) {
+          rawRows.push(...listed.data);
+        } else if (isPlainRecord(listed) && Array.isArray(listed.threads)) {
+          rawRows.push(...listed.threads);
+        }
       }
     }
 
@@ -297,6 +401,30 @@ export class SideChatV2BackendService {
     return [...deduped.values()].sort(compareSummaryDesc);
   }
 
+  private async fetchMainThreadsRaw(): Promise<MainThreadSummary[]> {
+    if (
+      this.cachedMainThreads &&
+      Date.now() - this.cachedMainThreads.fetchedAt < MAIN_THREADS_CACHE_TTL_MS
+    ) {
+      return this.cachedMainThreads.threads;
+    }
+    if (this.inFlightMainThreads) {
+      return this.inFlightMainThreads;
+    }
+    const pending = this.fetchMainThreadsUncached()
+      .then((threads) => {
+        this.cachedMainThreads = { threads, fetchedAt: Date.now() };
+        return threads;
+      })
+      .finally(() => {
+        if (this.inFlightMainThreads === pending) {
+          this.inFlightMainThreads = null;
+        }
+      });
+    this.inFlightMainThreads = pending;
+    return pending;
+  }
+
   async listMainThreads(): Promise<StrictJsonObject> {
     try {
       const threads = await this.fetchMainThreadsRaw();
@@ -307,18 +435,26 @@ export class SideChatV2BackendService {
     }
   }
 
-  private async listAttachedForSource(sourceThreadId: string): Promise<{
+  private async listAttachedForSource(
+    sourceThreadId: string,
+    timeoutMs = ATTACHED_LIST_TIMEOUT_MS,
+  ): Promise<{
     rows: HostAttachedThreadRow[];
     connected: boolean;
   }> {
     try {
-      const res = await this.channel.rpc<ThreadListResponse>("thread/list", {
-        attachedToThreadId: sourceThreadId,
-        sortKey: "updated_at",
-        sortDirection: "desc",
-        limit: 100,
-      });
-      const rows = isPlainRecord(res) && Array.isArray(res.data) ? (res.data as HostAttachedThreadRow[]) : [];
+      const res = await this.channel.rpc<ThreadListResponse>(
+        "thread/list",
+        {
+          attachedToThreadId: sourceThreadId,
+          sortKey: "updated_at",
+          sortDirection: "desc",
+          limit: 100,
+        },
+        { timeoutMs },
+      );
+      const rows =
+        isPlainRecord(res) && Array.isArray(res.data) ? (res.data as HostAttachedThreadRow[]) : [];
       return { rows, connected: true };
     } catch {
       return { rows: [], connected: false };
@@ -344,7 +480,7 @@ export class SideChatV2BackendService {
       return okReply({ threads: merged, channelConnected: connected });
     }
 
-    // Global listing for the standalone Workbench page.
+    // Global listing for the standalone Workbench page (strictly bounded under 10s IPC limit).
     const allLocal = this.store.list();
     const sourceIds = new Set<string>(allLocal.map((record) => record.sourceThreadId));
     let channelConnected = false;
@@ -352,7 +488,7 @@ export class SideChatV2BackendService {
     try {
       const mainThreads = await this.fetchMainThreadsRaw();
       channelConnected = true;
-      for (const main of mainThreads.slice(0, 12)) {
+      for (const main of mainThreads.slice(0, 8)) {
         sourceIds.add(main.threadId);
       }
     } catch {
@@ -366,18 +502,34 @@ export class SideChatV2BackendService {
       bySourceLocal.set(record.sourceThreadId, bucket);
     }
 
-    const sourceList = [...sourceIds];
-    const attachedEntries = await Promise.all(
-      sourceList.map(async (sid) => {
-        const res = await this.listAttachedForSource(sid);
-        if (res.connected) channelConnected = true;
-        return [sid, res.rows] as const;
-      }),
-    );
+    const sourceList = [...sourceIds].slice(0, 12);
+    const attachedBySource = new Map<string, HostAttachedThreadRow[]>();
+    if (sourceList.length > 0) {
+      const queries = Promise.all(
+        sourceList.map(async (sid) => {
+          const res = await this.listAttachedForSource(sid, ATTACHED_LIST_TIMEOUT_MS);
+          if (res.connected) channelConnected = true;
+          attachedBySource.set(sid, res.rows);
+        }),
+      );
+      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        queries,
+        new Promise<void>((resolveDeadline) => {
+          deadlineTimer = setTimeout(resolveDeadline, GLOBAL_ATTACHED_DEADLINE_MS);
+          deadlineTimer.unref?.();
+        }),
+      ]);
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+    }
 
     const combinedMap = new Map<string, V2SideChatSummary>();
-    for (const [sid, rows] of attachedEntries) {
-      const merged = mergeThreadsForSource(sid, bySourceLocal.get(sid) ?? [], rows);
+    for (const sid of sourceIds) {
+      const merged = mergeThreadsForSource(
+        sid,
+        bySourceLocal.get(sid) ?? [],
+        attachedBySource.get(sid) ?? [],
+      );
       for (const item of merged) {
         combinedMap.set(item.threadId, item);
       }
@@ -444,6 +596,7 @@ export class SideChatV2BackendService {
       title: initialTitle,
       boundaryConsumed: false,
     });
+    this.invalidateMainThreadsCache();
 
     if (question.length > 0) {
       const wireText = injectSideChatBoundary(question);
@@ -815,6 +968,7 @@ export class SideChatV2BackendService {
     }
 
     const removed = this.store.remove(threadId, sourceThreadId);
+    this.invalidateMainThreadsCache();
     return okReply({
       threadId,
       mode,

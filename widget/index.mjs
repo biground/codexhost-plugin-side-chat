@@ -209,37 +209,64 @@ export async function mount(root, api) {
     });
   }
 
-  async function refreshLists({ keepSelection = true, preferSourceThreadId = null, preferThreadId = null } = {}) {
+  let warmupRetryTimer = null;
+
+  async function refreshLists({
+    keepSelection = true,
+    preferSourceThreadId = null,
+    preferThreadId = null,
+    allowWarmupRetry = false,
+  } = {}) {
     if (state.disposed || api.signal.aborted) return;
 
-    const detected =
-      api.hostTarget === "web"
-        ? detectCurrentWebThreadContext(win, doc)
-        : { threadId: null, isDraft: false };
+    const detected = detectCurrentWebThreadContext(win, doc, api.hostTarget);
+    let fetchFailedError = null;
 
     try {
       const mainRes = await client.listMainThreads();
       if (state.disposed || api.signal.aborted) return;
       state.channelConnected = true;
       state.mainThreads = Array.isArray(mainRes?.threads) ? mainRes.threads : [];
-    } catch {
+      view.setError(null);
+    } catch (error) {
       if (state.disposed || api.signal.aborted) return;
       state.channelConnected = false;
+      fetchFailedError = error;
     }
 
     if (preferSourceThreadId) {
       state.sourceThreadId = preferSourceThreadId;
       state.isDraft = false;
-    } else if (detected.isDraft && !detected.threadId) {
+    } else if (detected.isDraft && !detected.threadId && state.mainThreads.length === 0) {
       state.sourceThreadId = null;
       state.isDraft = true;
     } else {
       state.isDraft = false;
+      const effectiveDetected =
+        detected.isDraft && !detected.threadId ? { threadId: null, isDraft: false } : detected;
       state.sourceThreadId = resolveActiveMainThreadId(
         state.mainThreads,
-        detected,
+        effectiveDetected,
         state.sourceThreadId,
       );
+    }
+
+    if (fetchFailedError) {
+      view.setError(fetchFailedError);
+    }
+
+    if (
+      allowWarmupRetry &&
+      (fetchFailedError || state.mainThreads.length === 0) &&
+      !warmupRetryTimer &&
+      !state.disposed
+    ) {
+      warmupRetryTimer = setTimeout(() => {
+        warmupRetryTimer = null;
+        if (!state.disposed && state.open) {
+          void refreshLists({ keepSelection: true, allowWarmupRetry: false });
+        }
+      }, 1500);
     }
 
     if (state.sourceThreadId) {
@@ -333,6 +360,7 @@ export async function mount(root, api) {
     } else {
       await refreshLists({
         keepSelection: true,
+        allowWarmupRetry: true,
         preferSourceThreadId:
           typeof detail.sourceThreadId === "string" && detail.sourceThreadId.trim()
             ? detail.sourceThreadId.trim()
@@ -415,6 +443,10 @@ export async function mount(root, api) {
   const cleanup = () => {
     if (state.disposed) return;
     state.disposed = true;
+    if (warmupRetryTimer) {
+      clearTimeout(warmupRetryTimer);
+      warmupRetryTimer = null;
+    }
     win?.removeEventListener(OPEN_EVENT_NAME, onOpenEvent);
     win?.removeEventListener("popstate", onNavChange);
     win?.removeEventListener("hashchange", onNavChange);

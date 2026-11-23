@@ -40,7 +40,7 @@ test("manifest.json strictly matches manifestVersion 2 schema and asset constrai
 
   assert.equal(manifest.manifestVersion, 2);
   assert.equal(manifest.id, "codexhost-side-chat");
-  assert.equal(manifest.version, "0.2.0");
+  assert.equal(manifest.version, "0.2.1");
   assert.equal(manifest.author, "biground");
   assert.equal(manifest.repository, "https://github.com/biground/codexhost-plugin-side-chat");
   assert.deepEqual(manifest.categories, ["workflow", "interface", "tools"]);
@@ -1118,4 +1118,248 @@ test("page/index.mjs and widget/index.mjs import cleanly as standard ESM and exp
   assert.equal(typeof widgetMod.mount, "function");
   assert.equal(typeof sharedViewMod.createModeBadge, "function");
   assert.equal(typeof sharedViewMod.createSideChatView, "function");
+});
+
+test("codexhost 0.25+ resilience: falls back to external-only catalog when stock Codex fails, skips unauthorized stale descriptors, and detects 0.25 DOM/Desktop threads", async (t) => {
+  const tempRoot = mkdtempSync(join(tmpdir(), "codexhost-side-chat-025-"));
+  t.after(() => rmSync(tempRoot, { recursive: true, force: true }));
+
+  const dataDir = join(tempRoot, "host-extension-data", "codexhost-side-chat");
+  const channelDir = join(tempRoot, "client-hosts");
+  mkdirSync(dataDir, { recursive: true });
+  mkdirSync(channelDir, { recursive: true });
+
+  const validToken = "b".repeat(64);
+  const staleToken = "c".repeat(64);
+  const validEpoch = "22222222-2222-4222-8222-222222222222";
+  const staleEpoch = "33333333-3333-4333-8333-333333333333";
+
+  // 1. Stale/reused-port server that always returns 401 Unauthorized
+  const staleServer = createServer((_req, res) => {
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { code: -32001, message: "Unauthorized" } }));
+  });
+  await new Promise<void>((r) => staleServer.listen(0, "127.0.0.1", r));
+  t.after(() => new Promise<void>((done) => staleServer.close(() => done())));
+  const stalePort = (staleServer.address() as { port: number }).port;
+
+  // 2. Real Shared Host ("owner": "service") where full catalog fails (stock Codex unavailable/cold timeout),
+  //    while `officialCursor: { live: null }` succeeds immediately with External Harness threads!
+  const seenCatalogParams: Array<Record<string, unknown>> = [];
+  const serviceServer = createServer((req, res) => {
+    if (req.headers.authorization !== `Bearer ${validToken}`) {
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { code: -32001, message: "Unauthorized" } }));
+      return;
+    }
+    if (req.method === "GET" && req.url === "/v1/events") {
+      res.writeHead(200, { "content-type": "application/x-ndjson" });
+      res.write(
+        JSON.stringify({
+          type: "hello",
+          version: 1,
+          cursor: { epoch: validEpoch, sequence: 1 },
+          reset: false,
+        }) + "\n",
+      );
+      return;
+    }
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => {
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      if (req.url === "/v1/rpc" && payload.method === "codexhost/thread/catalog/read") {
+        const params = (payload.params ?? {}) as Record<string, unknown>;
+        seenCatalogParams.push(params);
+        const cursor = params.officialCursor as { live?: unknown } | undefined;
+        if (!cursor || cursor.live !== null) {
+          // Simulate stock Codex cold-start / admission failure on 0.25.0
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: { code: -32000, message: "Official Codex runtime failed to start" },
+            }),
+          );
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            result: {
+              officialCursor: { live: null },
+              threads: [
+                {
+                  id: "agy-thread-025",
+                  name: "Antigravity Session on 0.25.0",
+                  preview: "Testing Side Chat on 0.25.0",
+                  cwd: "D:/WorkSpace",
+                  modelProvider: "codexhost",
+                  status: { type: "active" },
+                  createdAt: 1700000100,
+                  updatedAt: 1700000300,
+                },
+              ],
+              ownership: [{ threadId: "agy-thread-025", owner: "external", harnessId: "antigravity" }],
+              archivedThreadIds: [],
+            },
+          }),
+        );
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ result: { data: [] } }));
+    });
+  });
+  await new Promise<void>((r) => serviceServer.listen(0, "127.0.0.1", r));
+  t.after(() => new Promise<void>((done) => serviceServer.close(() => done())));
+  const servicePort = (serviceServer.address() as { port: number }).port;
+
+  // Write BOTH a newer-timestamped stale non-service descriptor AND an active `owner: "service"` descriptor
+  writeFileSync(
+    join(channelDir, `host-${process.pid}-${staleEpoch}.json`),
+    JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      port: stalePort,
+      token: staleToken,
+      startedAt: Date.now() + 10_000,
+      epoch: staleEpoch,
+    }),
+  );
+  writeFileSync(
+    join(channelDir, `host-${process.pid}-${validEpoch}.json`),
+    JSON.stringify({
+      version: 1,
+      owner: "service",
+      pid: process.pid,
+      port: servicePort,
+      token: validToken,
+      startedAt: Date.now(),
+      epoch: validEpoch,
+    }),
+  );
+
+  const backendMod = (await import(pathToFileURL(resolve(root, "backend/index.mjs")).href)) as {
+    activate: (ctx: {
+      extensionId: string;
+      extensionDir: string;
+      dataDir: string;
+      readSettings: () => Promise<Record<string, unknown>>;
+      writeSettings: (v: Record<string, unknown>) => Promise<Record<string, unknown>>;
+      handle: (method: string, handler: (params: unknown) => unknown) => void;
+    }) => Promise<() => void>;
+  };
+
+  const handlers = new Map<string, (params: unknown) => unknown>();
+  const dispose = await backendMod.activate({
+    extensionId: "codexhost-side-chat",
+    extensionDir: root,
+    dataDir,
+    readSettings: async () => ({}),
+    writeSettings: async (v) => v,
+    handle(method, handler) {
+      handlers.set(method, handler);
+    },
+  });
+  t.after(() => dispose());
+
+  const startedMs = Date.now();
+  const mainRes = (await handlers.get("listMainThreads")!({})) as {
+    ok: boolean;
+    threads: Array<{ threadId: string; title: string }>;
+  };
+  const elapsedMs = Date.now() - startedMs;
+
+  assert.ok(elapsedMs < 5_000, `listMainThreads must stay well under 10s IPC limit (took ${elapsedMs}ms)`);
+  assert.equal(mainRes.ok, true);
+  assert.equal(mainRes.threads.length, 1);
+  assert.equal(mainRes.threads[0]?.threadId, "agy-thread-025");
+  assert.equal(seenCatalogParams.length, 2);
+  assert.deepEqual(seenCatalogParams[1], {
+    includeArchived: false,
+    officialCursor: { live: null },
+  });
+
+  // 3. Verify 0.25.0 Web `Rows.tsx` `data-row-key` + `data-phase="hero"` + Desktop probe detection
+  const clientApiMod = (await import(
+    pathToFileURL(resolve(root, "shared/client-api.mjs")).href
+  )) as {
+    detectCurrentWebThreadContext: (
+      win: unknown,
+      doc: unknown,
+      hostTarget?: string,
+    ) => { threadId: string | null; isDraft: boolean };
+    parseSessionIdFromRowKey: (raw: string) => string | null;
+    resolveActiveMainThreadId: (
+      mainThreads: Array<{ threadId: string }>,
+      detected: { threadId: string | null; isDraft: boolean },
+      currentSelection: string | null,
+    ) => string | null;
+  };
+
+  assert.equal(clientApiMod.parseSessionIdFromRowKey("session:abc-123"), "abc-123");
+  assert.equal(clientApiMod.parseSessionIdFromRowKey("pinned:pin-456"), "pin-456");
+  assert.equal(clientApiMod.parseSessionIdFromRowKey("linked:ws-1:child-789"), "child-789");
+
+  // Desktop probe detection
+  const desktopCtx = clientApiMod.detectCurrentWebThreadContext(
+    {
+      location: { href: "app://-/index.html" },
+      __codexhostRendererBindingProbeV1: { currentThreadId: () => "desktop-thread-99" },
+    },
+    null,
+    "desktop",
+  );
+  assert.deepEqual(desktopCtx, { threadId: "desktop-thread-99", isDraft: false });
+
+  // Web 0.25+ active row detection via `data-row-key` when `data-phase="active"`
+  const web025ActiveDoc = {
+    querySelector(sel: string) {
+      if (sel === "[data-cx-region='conversation']") {
+        return { getAttribute: (name: string) => (name === "data-phase" ? "active" : null) };
+      }
+      if (sel === "[role='treeitem'][aria-current='page'][data-row-key]") {
+        return {
+          getAttribute: (name: string) => (name === "data-row-key" ? "session:agy-thread-025" : null),
+        };
+      }
+      return null;
+    },
+  };
+  assert.deepEqual(
+    clientApiMod.detectCurrentWebThreadContext(
+      { location: { href: "http://127.0.0.1:4400/" } },
+      web025ActiveDoc,
+      "web",
+    ),
+    { threadId: "agy-thread-025", isDraft: false },
+  );
+
+  // Web 0.25+ blank hero session detection (`data-phase="hero"`)
+  const web025HeroDoc = {
+    querySelector(sel: string) {
+      if (sel === "[data-cx-region='conversation']") {
+        return { getAttribute: (name: string) => (name === "data-phase" ? "hero" : null) };
+      }
+      return null;
+    },
+  };
+  assert.deepEqual(
+    clientApiMod.detectCurrentWebThreadContext(
+      { location: { href: "http://127.0.0.1:4400/" } },
+      web025HeroDoc,
+      "web",
+    ),
+    { threadId: null, isDraft: true },
+  );
+
+  // Remote SSH row (`ssh:conn:123`) falls back cleanly to local mainThreads[0] instead of selecting invalid local ID
+  assert.equal(
+    clientApiMod.resolveActiveMainThreadId(
+      [{ threadId: "agy-thread-025" }],
+      { threadId: "ssh:server-1:remote-thread", isDraft: false },
+      null,
+    ),
+    "agy-thread-025",
+  );
 });

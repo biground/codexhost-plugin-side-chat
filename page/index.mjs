@@ -458,7 +458,9 @@ export async function mount(root, api) {
     }
   }
 
-  async function reloadAll({ keepSelection = true } = {}) {
+  let warmupRetryTimer = null;
+
+  async function reloadAll({ keepSelection = true, allowWarmupRetry = false } = {}) {
     if (state.disposed || api.signal.aborted) return;
 
     const [statusOutcome, mainOutcome, sideOutcome] = await Promise.allSettled([
@@ -481,6 +483,14 @@ export async function mount(root, api) {
 
     if (mainOutcome.status === "fulfilled" && Array.isArray(mainOutcome.value?.threads)) {
       state.mainThreads = mainOutcome.value.threads;
+      state.channelConnected = true;
+      view.setError(null);
+    } else if (mainOutcome.status === "rejected") {
+      const errCode = mainOutcome.reason?.code;
+      if (errCode === "side-chat/channel-offline" || errCode === "side-chat/backend-error") {
+        state.channelConnected = false;
+      }
+      view.setError(mainOutcome.reason);
     }
 
     if (sideOutcome.status === "fulfilled" && Array.isArray(sideOutcome.value?.threads)) {
@@ -495,6 +505,20 @@ export async function mount(root, api) {
     renderMainSelect();
     renderSidebarList();
     syncActiveView();
+
+    if (
+      allowWarmupRetry &&
+      (mainOutcome.status === "rejected" || state.mainThreads.length === 0) &&
+      !warmupRetryTimer &&
+      !state.disposed
+    ) {
+      warmupRetryTimer = setTimeout(() => {
+        warmupRetryTimer = null;
+        if (!state.disposed) {
+          void reloadAll({ keepSelection: true, allowWarmupRetry: false });
+        }
+      }, 1500);
+    }
   }
 
   // Bind UI controls
@@ -542,6 +566,10 @@ export async function mount(root, api) {
   const cleanup = () => {
     if (state.disposed) return;
     state.disposed = true;
+    if (warmupRetryTimer) {
+      clearTimeout(warmupRetryTimer);
+      warmupRetryTimer = null;
+    }
     unsubLocale();
     unsubScheme();
     unsubStorage();
@@ -553,7 +581,7 @@ export async function mount(root, api) {
   state.settings = await readExtensionSettings(api);
   if (!state.disposed) {
     renderSettingsPanel();
-    await reloadAll({ keepSelection: true });
+    await reloadAll({ keepSelection: true, allowWarmupRetry: true });
   }
 
   return cleanup;

@@ -1,6 +1,6 @@
 /**
  * Browser-safe RPC wrapper around `api.backend.invoke(...)` and `api.storage`,
- * plus Web URL/DOM active main-thread detection helpers.
+ * plus Desktop / Web / Tauri Desktop Shell active main-thread detection helpers.
  *
  * Uses zero external dependencies and only relative `.mjs` static imports so it
  * links cleanly under Desktop's `@rollup/browser` and Web's native ESM loader.
@@ -109,17 +109,68 @@ export function createSideChatClient(api) {
 }
 
 /**
- * Inspects browser URL and CodexHost Web DOM attributes to infer the currently
- * viewed main thread ID, or whether the page is explicitly on a blank draft.
+ * Extracts a CodexHost Web session ID from `Rows.tsx` `data-row-key` values:
+ * - `session:<id>`, `recent:<id>`, `pinned:<id>`
+ * - `linked:<workspaceId>:<id>` (codexhost 0.25+ cross-workspace tree rows)
  */
-export function detectCurrentWebThreadContext(win = globalThis.window, doc = globalThis.document) {
+export function parseSessionIdFromRowKey(rawRowKey) {
+  if (typeof rawRowKey !== "string") return null;
+  const trimmed = rawRowKey.trim();
+  if (!trimmed) return null;
+
+  for (const prefix of ["session:", "recent:", "pinned:"]) {
+    if (trimmed.startsWith(prefix)) {
+      const id = trimmed.slice(prefix.length).trim();
+      return id.length > 0 ? id : null;
+    }
+  }
+
+  if (trimmed.startsWith("linked:")) {
+    const rest = trimmed.slice("linked:".length);
+    const sepIndex = rest.indexOf(":");
+    if (sepIndex !== -1) {
+      const id = rest.slice(sepIndex + 1).trim();
+      return id.length > 0 ? id : null;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Inspects browser URL, Official Codex Desktop probe API, and CodexHost Web / 0.25+
+ * DOM attributes to infer the currently viewed main thread ID or blank draft state.
+ */
+export function detectCurrentWebThreadContext(
+  win = globalThis.window,
+  doc = globalThis.document,
+  hostTarget = "web",
+) {
   const result = { threadId: null, isDraft: false };
+
+  // 1. Official Codex Desktop renderer probe API (`__codexhostRendererBindingProbeV1`)
+  if (hostTarget === "desktop" && win && typeof win === "object") {
+    try {
+      const probe = win.__codexhostRendererBindingProbeV1;
+      const probedId =
+        probe && typeof probe.currentThreadId === "function" ? probe.currentThreadId() : null;
+      if (typeof probedId === "string" && probedId.trim().length > 0) {
+        result.threadId = probedId.trim();
+        return result;
+      }
+    } catch {
+      // Ignore probe errors and fall back to URL/DOM inspection.
+    }
+  }
+
   if (!win || !win.location) return result;
 
+  // 2. Explicit URL query/path/hash inspection
   try {
     const url = new URL(win.location.href);
     const paramCandidate =
       url.searchParams.get("session") ||
+      url.searchParams.get("sessionId") ||
       url.searchParams.get("thread") ||
       url.searchParams.get("threadId");
     if (paramCandidate && paramCandidate.trim()) {
@@ -132,8 +183,10 @@ export function detectCurrentWebThreadContext(win = globalThis.window, doc = glo
     }
 
     const pathMatch =
-      /(?:^|\/)(?:threads?|sessions?|chat|c)\/([A-Za-z0-9_.:-]+)/u.exec(url.pathname) ||
-      /(?:^|\/)(?:threads?|sessions?)\/([A-Za-z0-9_.:-]+)/u.exec(url.hash.replace(/^#/u, ""));
+      /(?:^|\/)(?:threads?|sessions?|local|chat|c)\/([A-Za-z0-9_.:-]+)/u.exec(url.pathname) ||
+      /(?:^|\/)(?:threads?|sessions?|local)\/([A-Za-z0-9_.:-]+)/u.exec(
+        url.hash.replace(/^#/u, ""),
+      );
     if (pathMatch && pathMatch[1] && !/^(?:new|draft)$/iu.test(pathMatch[1])) {
       result.threadId = decodeURIComponent(pathMatch[1]);
       return result;
@@ -142,9 +195,10 @@ export function detectCurrentWebThreadContext(win = globalThis.window, doc = glo
       result.isDraft = true;
     }
   } catch {
-    // Non-standard URL (e.g. Desktop app://) — skip URL parsing.
+    // Non-standard URL (e.g. Desktop app://) — continue to DOM inspection.
   }
 
+  // 3. DOM inspection (supports explicit data-thread-id markers AND codexhost 0.25+ Rows.tsx / ConversationMainPanel.tsx)
   if (doc && typeof doc.querySelector === "function") {
     const selectors = [
       "[data-cx-region='conversation'][data-thread-id]",
@@ -184,6 +238,26 @@ export function detectCurrentWebThreadContext(win = globalThis.window, doc = glo
     );
     if (blankMarker) {
       result.isDraft = true;
+      return result;
+    }
+
+    // CodexHost Web & 0.25+ Tauri Desktop Shell: ConversationMainPanel `data-phase` + Sidebar `data-row-key`
+    const convRegion = doc.querySelector("[data-cx-region='conversation']");
+    const convPhase = convRegion ? convRegion.getAttribute("data-phase") : null;
+    if (convPhase === "hero") {
+      result.isDraft = true;
+      return result;
+    }
+
+    const activeRow =
+      doc.querySelector("[role='treeitem'][aria-current='page'][data-row-key]") ||
+      doc.querySelector("[role='treeitem'][aria-selected='true'][data-row-key]");
+    if (activeRow) {
+      const parsedId = parseSessionIdFromRowKey(activeRow.getAttribute("data-row-key"));
+      if (parsedId) {
+        result.threadId = parsedId;
+        return result;
+      }
     }
   }
 
@@ -191,15 +265,19 @@ export function detectCurrentWebThreadContext(win = globalThis.window, doc = glo
 }
 
 /**
- * Matches a candidate detected thread ID against the known main threads list.
+ * Matches a candidate detected thread ID against the known local main threads list.
  */
 export function resolveActiveMainThreadId(mainThreads, detectedContext, currentSelection) {
   const list = Array.isArray(mainThreads) ? mainThreads : [];
   if (detectedContext?.threadId) {
-    const direct = list.find((item) => item.threadId === detectedContext.threadId);
+    const candidate = detectedContext.threadId;
+    const direct = list.find((item) => item.threadId === candidate);
     if (direct) return direct.threadId;
-    // Allow using detected threadId directly even if mainThreads list hasn't caught up yet.
-    return detectedContext.threadId;
+    // Skip remote SSH session IDs (e.g. `ssh:<conn>:<id>`) that do not belong to local Host channel.
+    const looksRemoteScoped = candidate.includes(":");
+    if (!looksRemoteScoped) {
+      return candidate;
+    }
   }
   if (detectedContext?.isDraft) {
     return null;

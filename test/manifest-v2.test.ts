@@ -129,7 +129,7 @@ test("1. manifest.json strictly conforms to hostExtensionManifestV2Schema", () =
   assert.match(m.id, ID_REGEX);
   assert.ok(!RESERVED_DEVICE_NAME.test(m.id));
   assert.equal(m.id, "codexhost-side-chat");
-  assert.equal(m.version, "0.2.0");
+  assert.equal(m.version, "0.2.1");
   assertLocalized(m.name, 128, 1);
   assertLocalized(m.description, 4096, 0);
   assertLocalized(m.details, 16384, 0);

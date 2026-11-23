@@ -5,7 +5,7 @@
     "en": "Side Chat (/btw)",
     "zh-CN": "侧边聊天 (/btw)"
   },
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": {
     "en": "Ask parallel side questions in an isolated read-only context branch without polluting the main conversation — with persistent-first syncing, seamless ephemeral fallback, /btw quick trigger, standalone workbench, and floating drawer across Desktop and Web.",
     "zh-CN": "基于主对话只读上下文开启并行旁路侧边聊天，不污染主对话轮次；支持持久优先与无感临时回退、常驻模式徽标、Web 端 /btw 快捷提问、独立双栏工作台及跨 Desktop/Web 悬浮抽屉同步。"
